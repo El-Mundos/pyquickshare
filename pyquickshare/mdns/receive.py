@@ -158,22 +158,42 @@ async def get_interface_info() -> InterfaceInfo:
     else:
         ips.append(ip)
 
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
-        sock.bind(("0.0.0.0", 0))  # noqa: S104 - we only care about the port
-        _, port = sock.getsockname()
+    # A random port is incompatible with a static firewall (ufw, nftables), which
+    # can only be told about a port known ahead of time. QUICKSHARE_PORT pins it so
+    # a single firewall rule keeps working across restarts.
+    configured_port = os.environ.get("QUICKSHARE_PORT")
+    if configured_port is not None:
+        port = int(configured_port)
+        logger.debug("QUICKSHARE_PORT set, using: %d", port)
+    else:
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
+            sock.bind(("0.0.0.0", 0))  # noqa: S104 - we only care about the port
+            _, port = sock.getsockname()
 
     try:
         for interface in used_interfaces:
             await temporarily_open_port(interface, port)
     except dbus_next.errors.DBusError as e:
         if e.text == "The name is not activatable":
-            logger.exception(
-                "Failed to open port %d. Are you using firewalld? "
-                "You may need to manually open the port on your firewall.",
+            # firewalld simply is not installed. That is the normal case on
+            # distributions that ship ufw, nftables or no firewall at all, so it
+            # is not an error -- and a traceback here wrongly suggests the
+            # transfer is broken when the port may well be open already.
+            logger.info(
+                "firewalld is not available, not opening port %d automatically. "
+                "If transfers stall, allow TCP %d in your firewall.",
+                port,
                 port,
             )
+        else:
+            logger.warning(
+                "Failed to open port %d via firewalld: %s. "
+                "You may need to open it on your firewall manually.",
+                port,
+                e.text,
+            )
     except Exception:
-        logger.exception("Failed to open port %d. Are you using firewalld?", port)
+        logger.exception("Failed to open port %d via firewalld", port)
 
     logger.debug("Using port %d", port)
 
