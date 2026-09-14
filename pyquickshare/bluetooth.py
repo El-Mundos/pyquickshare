@@ -16,6 +16,7 @@ from pyquickshare.common import from_url64, to_url64
 from . import rfcomm
 from .dbus.dbus import get_proxy_object
 from .dbus.profile import _QuickShareProfile
+from .dbus.untyped import _ReceiveAdvertisement
 from .mdns.receive import EndpointInfo, parse_endpoint_info
 
 logger = logging.getLogger(__name__)
@@ -129,12 +130,17 @@ _BLUEZ_PATH = "/org/bluez"
 """ProfileManager1 and AgentManager1 live here, not on the root object."""
 
 _PROFILE_PATH = "/de/pyquickshare/QuickShareProfile"
+_ADVERTISEMENT_PATH = "/de/pyquickshare/QuickShareAdvertisement"
 
 VERSION_AND_PCP = 0x23
 """Version 1 in the upper 3 bits, PCP 3 in the lower 5. Matches make_service_name."""
 
 SERVICE_ID_HASH = (0xFC, 0x9F, 0x5E)
 """SHA-256 of the Quick Share service ID, truncated to 3 bytes."""
+
+_RECEIVE_ADVERTISEMENT_HEADER = 0x48
+_RECEIVE_ADVERTISEMENT_PREFIX_LENGTH = 8
+"""Header, service_id_hash and the three unknown zero bytes, before the body."""
 
 ENDPOINT_ID_LENGTH = 4
 MAX_ENDPOINT_INFO_LENGTH = 131
@@ -175,6 +181,58 @@ def make_bluetooth_device_name(endpoint_id: bytes, endpoint_info: bytes) -> str:
     # No UWB address; the trailing optional field is simply omitted.
 
     return to_url64(blob)
+
+
+def make_receive_advertisement(endpoint_id: bytes, endpoint_info: bytes) -> bytes:
+    """Build the BLE service data that marks us as a Quick Share receiver.
+
+    Setting the Bluetooth Classic adapter name is not enough to be offered as a
+    target: Android discovers receivers by scanning for BLE service data under
+    :data:`BLEUTOOTH_QUICKSHARE_RECEIVE_UUID`. A device advertising only over
+    Classic shows up in the phone's Bluetooth list but never in Quick Share.
+
+    The layout was recovered by capturing a real advertisement from an Android
+    phone with "visible to everyone" set (see ``tools/scan_quickshare.py``)::
+
+        [0]      0x48            header
+        [1:4]    fc9f5e          service_id_hash
+        [4:7]    000000          unknown, zero on every capture
+        [7]      0x31            offset at which the trailer starts
+        [8]      0x23            version_and_pcp
+        [9:12]   fc9f5e          service_id_hash again
+        [12:16]  b"42ZB"         endpoint_id, 4 ASCII alphanumerics
+        [16]     0x20            length of the endpoint info that follows
+        [17:49]  ...             endpoint info, exactly what make_n builds
+        [49:62]  ...             13 byte trailer of unknown meaning
+
+    The trailer is omitted: its meaning is unknown, and copying 13 bytes lifted
+    from another device's advertisement would be worse than leaving them out,
+    since some of them plainly vary per device.
+    """
+    if len(endpoint_id) != ENDPOINT_ID_LENGTH:
+        msg = f"endpoint_id must be {ENDPOINT_ID_LENGTH} bytes, got {len(endpoint_id)}"
+        raise ValueError(msg)
+
+    if len(endpoint_info) > MAX_ENDPOINT_INFO_LENGTH:
+        msg = f"endpoint_info must be at most {MAX_ENDPOINT_INFO_LENGTH} bytes"
+        raise ValueError(msg)
+
+    body = bytearray()
+    body.append(VERSION_AND_PCP)
+    body.extend(SERVICE_ID_HASH)
+    body.extend(endpoint_id)
+    body.append(len(endpoint_info))
+    body.extend(endpoint_info)
+
+    blob = bytearray()
+    blob.append(_RECEIVE_ADVERTISEMENT_HEADER)
+    blob.extend(SERVICE_ID_HASH)
+    blob.extend((0x00, 0x00, 0x00))
+    # Where the trailer would begin, which is the end of everything we emit.
+    blob.append(len(body) + _RECEIVE_ADVERTISEMENT_PREFIX_LENGTH)
+    blob.extend(body)
+
+    return bytes(blob)
 
 
 async def advertise_over_bluetooth(
@@ -235,7 +293,20 @@ async def advertise_over_bluetooth(
             },
         )
 
+        # Classic name: how a sender enumerating Bluetooth devices reads our
+        # endpoint info. Necessary, but on its own it only puts us in the phone's
+        # Bluetooth list, not in Quick Share.
         await adapter.set_alias(make_bluetooth_device_name(endpoint_id, endpoint_info))
+
+        # BLE presence: what Android actually scans for to find receivers.
+        advertisement = _ReceiveAdvertisement(
+            make_receive_advertisement(endpoint_id, endpoint_info),
+        )
+        bus.export(_ADVERTISEMENT_PATH, advertisement)
+        le_manager = adapter_proxy.get_interface("org.bluez.LEAdvertisingManager1")
+        await le_manager.call_register_advertisement(_ADVERTISEMENT_PATH, {})
+        logger.debug("Registered Quick Share BLE presence advertisement")
+
         # DiscoverableTimeout defaults to 180 seconds, after which BlueZ clears
         # Discoverable again. Left alone, discovery would simply stop working
         # three minutes in, with nothing in the log to say why. Zero means "until
@@ -252,6 +323,7 @@ async def advertise_over_bluetooth(
     return BluetoothAdvertisement(
         bus=bus,
         adapter=adapter,
+        adapter_proxy=adapter_proxy,
         previous_alias=previous_alias,
         previous_discoverable=previous_discoverable,
         previous_timeout=previous_timeout,
@@ -261,17 +333,19 @@ async def advertise_over_bluetooth(
 class BluetoothAdvertisement:
     """Undoes everything :func:`advertise_over_bluetooth` changed."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - all keyword-only, each one a value to restore
         self,
         *,
         bus: MessageBus,
         adapter: Any,
+        adapter_proxy: Any,
         previous_alias: str,
         previous_discoverable: bool,
         previous_timeout: int,
     ) -> None:
         self._bus = bus
         self._adapter = adapter
+        self._adapter_proxy = adapter_proxy
         self._previous_alias = previous_alias
         self._previous_discoverable = previous_discoverable
         self._previous_timeout = previous_timeout
@@ -288,6 +362,11 @@ class BluetoothAdvertisement:
             return
         self._stopped = True
 
+        with contextlib.suppress(Exception):
+            le_manager = self._adapter_proxy.get_interface("org.bluez.LEAdvertisingManager1")
+            await le_manager.call_unregister_advertisement(_ADVERTISEMENT_PATH)
+        with contextlib.suppress(Exception):
+            self._bus.unexport(_ADVERTISEMENT_PATH)
         with contextlib.suppress(Exception):
             await self._adapter.set_alias(self._previous_alias)
         with contextlib.suppress(Exception):
