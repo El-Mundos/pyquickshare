@@ -3,18 +3,15 @@ name = "pyquickshare"
 version = "0.1.0.post1"
 description = "An asynchronous Python implementation of the Android Quick Share (Nearby Share) protocol"
 authors = [{ name = "teaishealthy", email = "teaishealthy@protonmail.com" }]
-requires-python = "~=3.10.0"
+requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 dependencies = [
     "aiofile>=3.9.0",
-    "bless>=0.2.6",
     "cryptography>=44.0.1",
     "dbus-next>=0.2.3",
     "python-magic>=0.4.27",
     "zeroconf>=0.145.1",
-    # need to pin bleak (dependency of bless)
-    "bleak==0.22.3",
     "betterproto>=2.0.0b5",
 ]
 
