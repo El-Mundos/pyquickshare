@@ -208,9 +208,10 @@ async def advertise_over_bluetooth(
         adapter_proxy = await get_proxy_object(bus, "org.bluez", adapter_path)
         adapter = adapter_proxy.get_interface("org.bluez.Adapter1")
 
-        # Captured before we overwrite it so it can be put back.
+        # Captured before we overwrite them so they can be put back.
         previous_alias = await adapter.get_alias()
         previous_discoverable = await adapter.get_discoverable()
+        previous_timeout = await adapter.get_discoverable_timeout()
 
         profile = _QuickShareProfile(on_connection)
         bus.export(_PROFILE_PATH, profile)
@@ -229,6 +230,11 @@ async def advertise_over_bluetooth(
         )
 
         await adapter.set_alias(make_bluetooth_device_name(endpoint_id, endpoint_info))
+        # DiscoverableTimeout defaults to 180 seconds, after which BlueZ clears
+        # Discoverable again. Left alone, discovery would simply stop working
+        # three minutes in, with nothing in the log to say why. Zero means "until
+        # told otherwise", and the original value is restored on stop.
+        await adapter.set_discoverable_timeout(0)
         await adapter.set_discoverable(True)
     except Exception:
         logger.exception("Failed to advertise over Bluetooth, receiving over the network only")
@@ -242,6 +248,7 @@ async def advertise_over_bluetooth(
         adapter=adapter,
         previous_alias=previous_alias,
         previous_discoverable=previous_discoverable,
+        previous_timeout=previous_timeout,
     )
 
 
@@ -255,11 +262,13 @@ class BluetoothAdvertisement:
         adapter: Any,
         previous_alias: str,
         previous_discoverable: bool,
+        previous_timeout: int,
     ) -> None:
         self._bus = bus
         self._adapter = adapter
         self._previous_alias = previous_alias
         self._previous_discoverable = previous_discoverable
+        self._previous_timeout = previous_timeout
         self._stopped = False
 
     async def stop(self) -> None:
@@ -277,6 +286,8 @@ class BluetoothAdvertisement:
             await self._adapter.set_alias(self._previous_alias)
         with contextlib.suppress(Exception):
             await self._adapter.set_discoverable(self._previous_discoverable)
+        with contextlib.suppress(Exception):
+            await self._adapter.set_discoverable_timeout(self._previous_timeout)
         with contextlib.suppress(Exception):
             root = await get_proxy_object(self._bus, "org.bluez", "/")
             manager = root.get_interface("org.bluez.ProfileManager1")
