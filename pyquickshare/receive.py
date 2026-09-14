@@ -7,6 +7,7 @@ import contextlib
 import enum
 import math
 import os
+import socket
 import struct
 import time
 from logging import getLogger
@@ -24,11 +25,13 @@ from .common import (
     pick_mac_deterministically,
     safe_assert,
 )
+from .bluetooth import BluetoothAdvertisement, advertise_over_bluetooth
 from .connection import NearbyConnection
 from .mdns.receive import (
     IPV4Runner,
     get_interface_info,
     get_interfaces,
+    make_n,
     make_service,
 )
 from .protos import offline_wire_formats, wire_format
@@ -39,6 +42,9 @@ from .ukey2 import do_server_key_exchange
 NAME = "pyquickshare"
 
 logger = getLogger(__name__)
+
+_advertisements: list[BluetoothAdvertisement] = []
+"""Live Bluetooth advertisements, so the adapter can be restored on shutdown."""
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -65,7 +71,20 @@ def default_download_dir() -> Path:
 __all__ = (
     "ShareRequest",
     "receive",
+    "stop_advertising",
 )
+
+
+async def stop_advertising() -> None:
+    """Restore anything advertising changed system-wide.
+
+    Advertising over Bluetooth renames the user's adapter and makes it
+    discoverable. Both are visible to every device nearby and outlive this
+    process, so callers must invoke this on shutdown -- including on Ctrl-C --
+    or the machine is left called something like ``I1h1Tmf8n14AAA``.
+    """
+    while _advertisements:
+        await _advertisements.pop().stop()
 
 
 def to_pin(bytes_: bytes) -> str:
@@ -428,8 +447,10 @@ async def _handle_client(
     download_dir: Path | None = None,
 ) -> None:
     start = time.perf_counter()
-    ip, port = writer.get_extra_info("peername")
-    logger.debug("Connection from %s:%d", ip, port)
+    # A TCP peer is (host, port); an RFCOMM one is (bdaddr, channel). Both are
+    # two-tuples, but only describe them generically since this handles either.
+    peer = writer.get_extra_info("peername")
+    logger.debug("Connection from %s", _format_peer(peer))
 
     conn = ReceiveConnection(reader, writer, endpoint_id=endpoint_id)
 
@@ -465,6 +486,45 @@ async def _handle_client(
         await writer.wait_closed()
 
 
+def _format_peer(peer: object) -> str:
+    """Describe a peer address without assuming which transport it came from."""
+    if isinstance(peer, tuple) and len(peer) == 2:  # noqa: PLR2004
+        return f"{peer[0]}:{peer[1]}"
+    return repr(peer)
+
+
+async def _handle_bluetooth_fd(
+    requests: asyncio.Queue[ShareRequest],
+    fd: int,
+    device: str,
+    *,
+    endpoint_id: bytes,
+    download_dir: Path | None = None,
+) -> None:
+    """Serve a Quick Share session over a socket BlueZ already connected.
+
+    The transport is interchangeable as far as the protocol is concerned --
+    everything below wants a reader and a writer -- so a Bluetooth client goes
+    through exactly the same path as one that arrived over TCP.
+    """
+    try:
+        sock = socket.socket(fileno=fd)
+    except OSError:
+        logger.exception("Could not wrap the Bluetooth socket for %s", device)
+        return
+
+    try:
+        reader, writer = await asyncio.open_connection(sock=sock)
+    except OSError:
+        logger.exception("Could not open a stream over Bluetooth to %s", device)
+        sock.close()
+        return
+
+    await _handle_client(
+        requests, reader, writer, endpoint_id=endpoint_id, download_dir=download_dir
+    )
+
+
 async def _socket_server(
     requests: asyncio.Queue[ShareRequest],
     *,
@@ -487,6 +547,8 @@ async def receive(
     *,
     endpoint_id: bytes | None = None,
     download_dir: Path | str | None = None,
+    name: str | None = None,
+    bluetooth: bool = True,
 ) -> AsyncIterator[ShareRequest]:
     """Receive something over Quick Share. Runs forever.
 
@@ -513,11 +575,12 @@ async def receive(
     )
     interface_info = await get_interface_info()
 
+    device_name = (name or NAME).encode("utf-8")
     info = await make_service(
         endpoint_id=endpoint_id,
         visible=True,
         type_=Type.laptop,
-        name=NAME.encode("utf-8"),
+        name=device_name,
         interface_info=interface_info,
     )
     services = [info]
@@ -541,6 +604,24 @@ async def receive(
         )
     )
     create_task(_start_mdns_service(services))
+
+    if bluetooth:
+        # BlueZ owns the RFCOMM socket and hands us a connected fd per client,
+        # so it also allocates the channel and publishes the SDP record.
+        def on_bluetooth_connection(fd: int, device: str) -> None:
+            create_task(
+                _handle_bluetooth_fd(
+                    result, fd, device, endpoint_id=endpoint_id, download_dir=directory
+                )
+            )
+
+        advertisement = await advertise_over_bluetooth(
+            endpoint_id=endpoint_id,
+            endpoint_info=bytes(make_n(visible=True, type=Type.laptop, name=device_name)),
+            on_connection=on_bluetooth_connection,
+        )
+        if advertisement is not None:
+            _advertisements.append(advertisement)
 
     while True:
         yield await result.get()

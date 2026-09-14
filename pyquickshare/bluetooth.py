@@ -1,16 +1,21 @@
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import logging
 import socket
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any, cast
 
 from dbus_next.aio.message_bus import MessageBus
 from dbus_next.constants import BusType
+from dbus_next.signature import Variant
 
 from pyquickshare.common import from_url64, to_url64
 
 from . import rfcomm
 from .dbus.dbus import get_proxy_object
+from .dbus.profile import _QuickShareProfile
 from .mdns.receive import EndpointInfo, parse_endpoint_info
 
 logger = logging.getLogger(__name__)
@@ -120,6 +125,8 @@ async def connect_bluetooth_device(device: BluetoothDevice) -> socket.socket:
     return sock
 
 
+_PROFILE_PATH = "/de/pyquickshare/QuickShareProfile"
+
 VERSION_AND_PCP = 0x23
 """Version 1 in the upper 3 bits, PCP 3 in the lower 5. Matches make_service_name."""
 
@@ -165,6 +172,132 @@ def make_bluetooth_device_name(endpoint_id: bytes, endpoint_info: bytes) -> str:
     # No UWB address; the trailing optional field is simply omitted.
 
     return to_url64(blob)
+
+
+async def advertise_over_bluetooth(
+    *,
+    endpoint_id: bytes,
+    endpoint_info: bytes,
+    on_connection: Callable[[int, str], None],
+) -> BluetoothAdvertisement | None:
+    """Become discoverable as a Quick Share target over Bluetooth Classic.
+
+    Three things have to be true before a phone will offer to send to us with no
+    network: the Quick Share RFCOMM service must be published over SDP, the
+    adapter must be discoverable, and the adapter's name must carry our encoded
+    endpoint info, which is where senders read it from.
+
+    That last one mutates a system-wide, user-visible setting, so the previous
+    alias is captured here and must be restored -- see
+    :meth:`BluetoothAdvertisement.stop`. Leaving a machine called
+    ``I1h1Tmf8n14AAA`` in everyone's Bluetooth list would be rude.
+
+    Returns:
+        A handle to stop advertising with, or ``None`` if Bluetooth is
+        unavailable. Missing Bluetooth is not fatal: LAN receiving still works.
+    """
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception:  # noqa: BLE001 - any BlueZ failure means no Bluetooth, which is survivable
+        logger.info("Could not reach BlueZ, not advertising over Bluetooth")
+        return None
+
+    try:
+        root = await get_proxy_object(bus, "org.bluez", "/")
+        adapter_path = await get_bluetooth_adapter_path(root)
+        adapter_proxy = await get_proxy_object(bus, "org.bluez", adapter_path)
+        adapter = adapter_proxy.get_interface("org.bluez.Adapter1")
+
+        # Captured before we overwrite it so it can be put back.
+        previous_alias = await adapter.get_alias()
+        previous_discoverable = await adapter.get_discoverable()
+
+        profile = _QuickShareProfile(on_connection)
+        bus.export(_PROFILE_PATH, profile)
+
+        manager = root.get_interface("org.bluez.ProfileManager1")
+        await manager.call_register_profile(
+            _PROFILE_PATH,
+            BLEUTOOTH_QUICKSHARE_UUID,
+            {
+                "Name": Variant("s", "Quick Share"),
+                "Role": Variant("s", "server"),
+                # BlueZ picks a free channel and publishes it over SDP.
+                "RequireAuthentication": Variant("b", False),
+                "RequireAuthorization": Variant("b", False),
+            },
+        )
+
+        await adapter.set_alias(make_bluetooth_device_name(endpoint_id, endpoint_info))
+        await adapter.set_discoverable(True)
+    except Exception:
+        logger.exception("Failed to advertise over Bluetooth, receiving over the network only")
+        with contextlib.suppress(Exception):
+            bus.disconnect()
+        return None
+
+    logger.debug("Advertising as a Quick Share target over Bluetooth")
+    return BluetoothAdvertisement(
+        bus=bus,
+        adapter=adapter,
+        previous_alias=previous_alias,
+        previous_discoverable=previous_discoverable,
+    )
+
+
+class BluetoothAdvertisement:
+    """Undoes everything :func:`advertise_over_bluetooth` changed."""
+
+    def __init__(
+        self,
+        *,
+        bus: MessageBus,
+        adapter: Any,
+        previous_alias: str,
+        previous_discoverable: bool,
+    ) -> None:
+        self._bus = bus
+        self._adapter = adapter
+        self._previous_alias = previous_alias
+        self._previous_discoverable = previous_discoverable
+        self._stopped = False
+
+    async def stop(self) -> None:
+        """Restore the adapter, best effort, exactly once.
+
+        Runs during shutdown, so every step is attempted independently: failing
+        to unregister the profile must not leave the user's adapter named after
+        an encoded endpoint blob.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+
+        with contextlib.suppress(Exception):
+            await self._adapter.set_alias(self._previous_alias)
+        with contextlib.suppress(Exception):
+            await self._adapter.set_discoverable(self._previous_discoverable)
+        with contextlib.suppress(Exception):
+            root = await get_proxy_object(self._bus, "org.bluez", "/")
+            manager = root.get_interface("org.bluez.ProfileManager1")
+            await manager.call_unregister_profile(_PROFILE_PATH)
+        with contextlib.suppress(Exception):
+            self._bus.disconnect()
+
+        logger.debug("Stopped advertising over Bluetooth, adapter restored")
+
+
+async def get_bluetooth_adapter_path(root_obj: Any) -> str:
+    """Return the object path of the first Bluetooth adapter."""
+    object_manager = root_obj.get_interface("org.freedesktop.DBus.ObjectManager")
+    objects = await object_manager.call_get_managed_objects()
+
+    for path, interfaces in objects.items():
+        if "org.bluez.Adapter1" in interfaces:
+            return path
+
+    msg = "No Bluetooth adapter found"
+    raise RuntimeError(msg)
 
 
 def parse_bluetooth_device_name(name: str) -> EndpointInfo:
