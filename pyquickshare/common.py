@@ -257,7 +257,7 @@ ENDPOINT_ID_ALPHABET = string.ascii_letters + string.digits
 
 
 def derive_endpoint_id_from_mac(mac: bytes) -> bytes:
-    """Derive a stable endpoint ID from a MAC address.
+    r"""Derive a stable endpoint ID from a MAC address.
 
     Masking each digest byte with 0b0111111 caps it at 63, which lands in the
     control character range: a typical result was b'(3\\x15\\x03'. That
@@ -270,9 +270,54 @@ def derive_endpoint_id_from_mac(mac: bytes) -> bytes:
     return bytes(ord(ENDPOINT_ID_ALPHABET[byte % len(ENDPOINT_ID_ALPHABET)]) for byte in digest)
 
 
+ROUTE_PATH = pathlib.Path("/proc/net/route")
+
+
+def get_default_route_interface(route_path: pathlib.Path | None = None) -> str | None:
+    """Return the interface carrying the preferred default route.
+
+    There is routinely more than one -- a laptop with ethernet plugged in while
+    Wi-Fi stays associated has a default route on both -- and the kernel uses the
+    one with the lowest metric. Taking whichever appears first in the file would
+    pick by accident of ordering.
+    """
+    route_path = route_path or ROUTE_PATH
+    # Iface Destination Gateway Flags RefCnt Use Metric ...
+    iface_field, destination_field, metric_field = 0, 1, 6
+    best: tuple[int, str] | None = None
+
+    with suppress(OSError):
+        for line in route_path.read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) <= metric_field or fields[destination_field] != "00000000":
+                continue
+            with suppress(ValueError):
+                metric = int(fields[metric_field])
+                if best is None or metric < best[0]:
+                    best = (metric, fields[iface_field])
+
+    return best[1] if best else None
+
+
 def pick_mac_deterministically(interfaces: list[str]) -> bytes:
-    interface = sorted(interfaces)[0]
-    return get_interface_mac(interface)
+    """Choose the interface whose MAC identifies this device.
+
+    The endpoint ID derives from this MAC, so a different choice means a
+    different identity and the sending device sees an entirely new target.
+    Sorting alphabetically made that choice depend on which interfaces happened
+    to have a carrier: on a laptop with both, 'enp3s0' sorts before 'wlo1', so
+    plugging in ethernet silently renamed the device even though Wi-Fi was still
+    what carried the traffic and the advertised address.
+
+    Prefer the interface holding the default route, which is the one whose IP is
+    advertised, and fall back to the previous behaviour when there is no default
+    route or it is not a usable interface.
+    """
+    default_interface = get_default_route_interface()
+    if default_interface and default_interface in interfaces:
+        return get_interface_mac(default_interface)
+
+    return get_interface_mac(min(interfaces))
 
 
 def with_semaphore(
