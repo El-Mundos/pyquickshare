@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import string
 import struct
 import typing
 from collections.abc import Awaitable, Callable
@@ -251,8 +252,22 @@ def generate_paired_key_encryption(
     )
 
 
+ENDPOINT_ID_ALPHABET = string.ascii_letters + string.digits
+"""The alphabet generate_endpoint_id draws from; endpoint IDs are printable ASCII."""
+
+
 def derive_endpoint_id_from_mac(mac: bytes) -> bytes:
-    return bytes(i & 0b0111111 for i in hashlib.blake2b(mac, digest_size=4).digest())
+    """Derive a stable endpoint ID from a MAC address.
+
+    Masking each digest byte with 0b0111111 caps it at 63, which lands in the
+    control character range: a typical result was b'(3\\x15\\x03'. That
+    contradicts receive()'s own contract that an endpoint ID is 4 ASCII bytes,
+    and differs from generate_endpoint_id, which returns alphanumerics. Map onto
+    the same alphabet instead, which keeps the derivation deterministic while
+    producing an ID that survives being embedded in a Bluetooth adapter name.
+    """
+    digest = hashlib.blake2b(mac, digest_size=4).digest()
+    return bytes(ord(ENDPOINT_ID_ALPHABET[byte % len(ENDPOINT_ID_ALPHABET)]) for byte in digest)
 
 
 def pick_mac_deterministically(interfaces: list[str]) -> bytes:

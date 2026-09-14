@@ -125,6 +125,9 @@ async def connect_bluetooth_device(device: BluetoothDevice) -> socket.socket:
     return sock
 
 
+_BLUEZ_PATH = "/org/bluez"
+"""ProfileManager1 and AgentManager1 live here, not on the root object."""
+
 _PROFILE_PATH = "/de/pyquickshare/QuickShareProfile"
 
 VERSION_AND_PCP = 0x23
@@ -216,7 +219,10 @@ async def advertise_over_bluetooth(
         profile = _QuickShareProfile(on_connection)
         bus.export(_PROFILE_PATH, profile)
 
-        manager = root.get_interface("org.bluez.ProfileManager1")
+        # ProfileManager1 lives on /org/bluez. The root object only carries
+        # ObjectManager, which is what the adapter lookup above walks.
+        manager_proxy = await get_proxy_object(bus, "org.bluez", _BLUEZ_PATH)
+        manager = manager_proxy.get_interface("org.bluez.ProfileManager1")
         await manager.call_register_profile(
             _PROFILE_PATH,
             BLEUTOOTH_QUICKSHARE_UUID,
@@ -289,8 +295,8 @@ class BluetoothAdvertisement:
         with contextlib.suppress(Exception):
             await self._adapter.set_discoverable_timeout(self._previous_timeout)
         with contextlib.suppress(Exception):
-            root = await get_proxy_object(self._bus, "org.bluez", "/")
-            manager = root.get_interface("org.bluez.ProfileManager1")
+            manager_proxy = await get_proxy_object(self._bus, "org.bluez", _BLUEZ_PATH)
+            manager = manager_proxy.get_interface("org.bluez.ProfileManager1")
             await manager.call_unregister_profile(_PROFILE_PATH)
         with contextlib.suppress(Exception):
             self._bus.disconnect()
