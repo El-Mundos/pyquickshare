@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import socket
 from collections.abc import AsyncGenerator, Callable
 from typing import Any, cast
@@ -138,6 +139,7 @@ VERSION_AND_PCP = 0x23
 SERVICE_ID_HASH = (0xFC, 0x9F, 0x5E)
 """SHA-256 of the Quick Share service ID, truncated to 3 bytes."""
 
+_MAC_LENGTH = 6
 _RECEIVE_ADVERTISEMENT_HEADER = 0x48
 _RECEIVE_ADVERTISEMENT_PREFIX_LENGTH = 8
 """Header, service_id_hash and the three unknown zero bytes, before the body."""
@@ -183,7 +185,46 @@ def make_bluetooth_device_name(endpoint_id: bytes, endpoint_info: bytes) -> str:
     return to_url64(blob)
 
 
-def make_receive_advertisement(endpoint_id: bytes, endpoint_info: bytes) -> bytes:
+def make_advertisement_trailer(bluetooth_mac: bytes) -> bytes:
+    """Build the trailing block that tells a sender where to connect.
+
+    Captured from three real advertisements across two Android phones. The first
+    six bytes are the device's Bluetooth Classic address, verbatim: a phone seen
+    at ``20:3B:34:6E:27:E1`` advertised a trailer starting ``203b346e27e1``.
+
+    This is very likely what makes off-network transfers possible at all. BLE
+    carries only discovery; the transfer itself runs over RFCOMM, and without an
+    address in the advertisement a sender has discovered a receiver it has no way
+    to reach. It matches the observed failure, where a phone with Wi-Fi disabled
+    never opened a Bluetooth connection at all.
+
+    The remaining bytes are less certain. Two captures of the same phone differed
+    only in offsets 8, 9 and 12, while ``01 00`` at offsets 10 and 11 held across
+    every capture from both devices, so that pair is treated as constant and the
+    rest as a rotating counter.
+    """
+    if len(bluetooth_mac) != _MAC_LENGTH:
+        msg = f"bluetooth_mac must be {_MAC_LENGTH} bytes, got {len(bluetooth_mac)}"
+        raise ValueError(msg)
+
+    trailer = bytearray(bluetooth_mac)
+    trailer.extend((0x00, 0x00))
+    trailer.extend(secrets.token_bytes(2))  # varied between captures
+    trailer.extend((0x01, 0x00))  # constant across every capture seen
+    trailer.extend(secrets.token_bytes(1))  # varied between captures
+    return bytes(trailer)
+
+
+def parse_mac(address: str) -> bytes:
+    """Turn a BlueZ address string such as 'F4:6D:3F:60:C7:E5' into bytes."""
+    return bytes.fromhex(address.replace(":", ""))
+
+
+def make_receive_advertisement(
+    endpoint_id: bytes,
+    endpoint_info: bytes,
+    trailer: bytes = b"",
+) -> bytes:
     """Build the BLE service data that marks us as a Quick Share receiver.
 
     Setting the Bluetooth Classic adapter name is not enough to be offered as a
@@ -228,9 +269,10 @@ def make_receive_advertisement(endpoint_id: bytes, endpoint_info: bytes) -> byte
     blob.append(_RECEIVE_ADVERTISEMENT_HEADER)
     blob.extend(SERVICE_ID_HASH)
     blob.extend((0x00, 0x00, 0x00))
-    # Where the trailer would begin, which is the end of everything we emit.
+    # Offset at which the trailer begins, which every capture agreed on.
     blob.append(len(body) + _RECEIVE_ADVERTISEMENT_PREFIX_LENGTH)
     blob.extend(body)
+    blob.extend(trailer)
 
     return bytes(blob)
 
@@ -299,8 +341,15 @@ async def advertise_over_bluetooth(
         await adapter.set_alias(make_bluetooth_device_name(endpoint_id, endpoint_info))
 
         # BLE presence: what Android actually scans for to find receivers.
+        # The trailer carries this adapter's Bluetooth address, which is how a
+        # sender knows where to open the RFCOMM connection after discovery.
+        adapter_address = parse_mac(await adapter.get_address())
         advertisement = _ReceiveAdvertisement(
-            make_receive_advertisement(endpoint_id, endpoint_info),
+            make_receive_advertisement(
+                endpoint_id,
+                endpoint_info,
+                make_advertisement_trailer(adapter_address),
+            ),
         )
         bus.export(_ADVERTISEMENT_PATH, advertisement)
         le_manager = adapter_proxy.get_interface("org.bluez.LEAdvertisingManager1")
