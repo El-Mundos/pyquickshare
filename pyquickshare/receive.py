@@ -6,12 +6,12 @@ import asyncio
 import contextlib
 import enum
 import math
+import os
 import struct
 import time
 from logging import getLogger
-from typing import TYPE_CHECKING, cast
-
-import aiofile
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from .backend import EncryptedBackend
 from .common import (
@@ -33,6 +33,7 @@ from .mdns.receive import (
 )
 from .protos import offline_wire_formats, wire_format
 from .results import FileResult, Result, TextResult, WifiResult
+from .sinks import FileSink, MemorySink, PayloadSink, safe_file_name, unique_path
 from .ukey2 import do_server_key_exchange
 
 NAME = "pyquickshare"
@@ -40,9 +41,25 @@ NAME = "pyquickshare"
 logger = getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from zeroconf.asyncio import AsyncServiceInfo
+
+
+def default_download_dir() -> Path:
+    """Where received files are written unless told otherwise.
+
+    This used to be the relative path ``downloads/``, which resolved against the
+    process working directory -- so where a file landed depended on where the
+    program happened to be started from, and receiving failed outright if the
+    directory did not already exist.
+    """
+    configured = os.environ.get("QUICKSHARE_DOWNLOAD_DIR")
+    if configured:
+        return Path(configured).expanduser()
+
+    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
+    return Path(xdg).expanduser() if xdg else Path.home() / "Downloads"
 
 
 __all__ = (
@@ -68,15 +85,35 @@ def to_pin(bytes_: bytes) -> str:
 
 
 class ShareRequest:
+    """An incoming offer, surfaced before it is accepted.
+
+    A GUI needs to tell the user who is sending and what, which means the offer
+    has to carry the introduction's metadata rather than just a raw header.
+    """
+
     def __init__(
         self,
         header: offline_wire_formats.PayloadTransferFramePayloadHeader,
         pin: str,
+        *,
+        sender: str = "",
+        mode: ReceiveMode | None = None,
+        items: list[ShareItem] | None = None,
     ) -> None:
         self.respond: asyncio.Future[bool] = asyncio.Future()
         self.done: asyncio.Future[list[Result]] = asyncio.Future()
         self.header: offline_wire_formats.PayloadTransferFramePayloadHeader = header
         self.pin: str = pin
+        self.sender: str = sender
+        self.mode: ReceiveMode | None = mode
+        self.items: list[ShareItem] = items or []
+        self.on_progress: Callable[[int, int], None] | None = None
+        """Called with (bytes received, total bytes) as the transfer runs."""
+
+    @property
+    def total_size(self) -> int:
+        """Total bytes offered, across every item."""
+        return sum(item.size for item in self.items)
 
     async def accept(self) -> list[Result]:
         self.respond.set_result(True)
@@ -85,6 +122,14 @@ class ShareRequest:
     async def reject(self) -> None:
         self.respond.set_result(False)
         await self.done
+
+
+class ShareItem(NamedTuple):
+    """One thing being offered, known before the transfer starts."""
+
+    name: str
+    size: int
+    mime_type: str = ""
 
 
 class ReceiveMode(enum.Enum):
@@ -105,7 +150,35 @@ def _generate_accept() -> wire_format.Frame:
     )
 
 
+def _generate_reject() -> wire_format.Frame:
+    """Tell the sender we are declining, rather than going silent.
+
+    Staying quiet leaves the sending device waiting until it times out, which
+    reads as a hung transfer rather than a refusal.
+    """
+    return wire_format.Frame(
+        version=wire_format.FrameVersion.V1,
+        v1=wire_format.V1Frame(
+            type=wire_format.V1FrameFrameType.RESPONSE,
+            connection_response=wire_format.ConnectionResponseFrame(
+                status=wire_format.ConnectionResponseFrameStatus.REJECT,
+            ),
+        ),
+    )
+
+
 class ReceiveConnection(NearbyConnection):
+    async def _reject_introduction(self) -> None:
+        """Decline an offer, best effort.
+
+        The caller is already tearing the connection down, so a send failure here
+        changes nothing -- the sender sees a closed connection either way.
+        """
+        try:
+            await self.send_frame(_generate_reject())
+        except Exception:
+            logger.exception("Failed to send rejection, closing anyway")
+
     async def _exchange_connection_response_server(self) -> None:
         """Read CONNECTION_RESPONSE, send ours."""
         data = await self._backend.recv()
@@ -133,6 +206,8 @@ class ReceiveConnection(NearbyConnection):
         self,
         requests: asyncio.Queue[ShareRequest],
         name: str,
+        *,
+        download_dir: Path | None = None,
     ) -> None:
         receive_mode: ReceiveMode | None = None
         expected_payload_ids: dict[
@@ -144,32 +219,63 @@ class ReceiveConnection(NearbyConnection):
 
         request: ShareRequest | None = None
         results: list[Result] = []
+        directory = download_dir or default_download_dir()
+        # Where each file payload is being streamed, so the completed payload can
+        # be reported at the path it actually landed on.
+        file_paths: dict[int, Path] = {}
+        progress_total = 0
 
-        async for payload_header, data in self.iter_payloads():
+        def open_sink(
+            header: offline_wire_formats.PayloadTransferFramePayloadHeader,
+        ) -> PayloadSink:
+            """Stream file payloads to disk; keep everything else in memory.
+
+            Text, Wi-Fi credentials and control frames are small and get parsed
+            as a whole, so buffering them costs nothing. Files are unbounded.
+            """
+            if receive_mode is not ReceiveMode.FILES or header.id not in expected_payload_ids:
+                return MemorySink()
+
+            path = unique_path(directory, safe_file_name(header.file_name))
+            file_paths[header.id] = path
+            logger.debug("Streaming payload %d to %s", header.id, path)
+            return FileSink(path)
+
+        def on_progress(
+            _header: offline_wire_formats.PayloadTransferFramePayloadHeader,
+            received: int,
+        ) -> None:
+            if request is None or request.on_progress is None:
+                return
+            # header.total_size is this payload; the offer may span several.
+            request.on_progress(progress_total + received, request.total_size)
+
+        async for payload_header, data in self.iter_payloads(
+            open_sink=open_sink,
+            on_progress=on_progress,
+        ):
             if payload_header.id in expected_payload_ids:
                 metadata = expected_payload_ids.pop(payload_header.id)
 
                 if receive_mode is ReceiveMode.FILES:
                     metadata = cast(wire_format.FileMetadata, metadata)
 
-                    logger.debug(
-                        "Received full file, saving to downloads/%s",
-                        payload_header.file_name,
-                    )
-                    async with aiofile.async_open(
-                        f"downloads/{payload_header.file_name}", "wb"
-                    ) as f:
-                        await f.write(data)
+                    # Already streamed to disk by FileSink; nothing to write here.
+                    path = file_paths.pop(payload_header.id)
+                    progress_total += payload_header.total_size
+                    logger.debug("Received file, saved to %s", path)
 
                     results.append(
                         FileResult(
-                            name=payload_header.file_name,
-                            path=f"downloads/{payload_header.file_name}",
+                            name=path.name,
+                            path=str(path),
                             size=payload_header.total_size,
                         ),
                     )
                 elif receive_mode is ReceiveMode.WIFI:
                     metadata = cast(wire_format.WifiCredentialsMetadata, metadata)
+                    # Non-file payloads use MemorySink, so data is always bytes.
+                    safe_assert(data is not None, "wifi payload arrived without data")
 
                     credentials = wire_format.WifiCredentials().parse(data)
 
@@ -187,6 +293,7 @@ class ReceiveConnection(NearbyConnection):
                     )
                 elif receive_mode is ReceiveMode.TEXT:
                     metadata = cast(wire_format.TextMetadata, metadata)
+                    safe_assert(data is not None, "text payload arrived without data")
 
                     logger.debug("Received text %d", payload_header.id)
 
@@ -198,6 +305,8 @@ class ReceiveConnection(NearbyConnection):
                     )
 
             else:
+                # Control frames are never streamed to disk.
+                safe_assert(data is not None, "control frame arrived without data")
                 wire_frame = wire_format.Frame().parse(data)
 
                 if wire_frame.v1.type == wire_format.V1FrameFrameType.PAIRED_KEY_RESULT:
@@ -208,34 +317,56 @@ class ReceiveConnection(NearbyConnection):
                     ...
                 elif wire_frame.v1.type == wire_format.V1FrameFrameType.INTRODUCTION:
                     if wire_frame.v1.introduction.wifi_credentials_metadata:
+                        wifi_metadata = wire_frame.v1.introduction.wifi_credentials_metadata
                         receive_mode = ReceiveMode.WIFI
-                        request = ShareRequest(payload_header, to_pin(self.auth_string))
-                        await requests.put(request)
                         logger.debug(
-                            "Receiving wifi credentials for ssids %r",
-                            ", ".join(
-                                m.ssid for m in wire_frame.v1.introduction.wifi_credentials_metadata
-                            ),
+                            "%r wants to send wifi credentials for ssids %r",
+                            name,
+                            ", ".join(m.ssid for m in wifi_metadata),
                         )
 
-                        expected_payload_ids.update(
-                            {
-                                m.payload_id: m
-                                for m in wire_frame.v1.introduction.wifi_credentials_metadata
-                            },
+                        request = ShareRequest(
+                            payload_header,
+                            to_pin(self.auth_string),
+                            sender=name,
+                            mode=receive_mode,
+                            items=[ShareItem(name=m.ssid, size=0) for m in wifi_metadata],
                         )
+                        await requests.put(request)
 
+                        # Credentials join a network on the user's behalf; that is
+                        # not something to take without asking.
+                        if not await request.respond:
+                            logger.debug("Rejecting wifi credentials")
+                            await self._reject_introduction()
+                            break
+
+                        expected_payload_ids.update({m.payload_id: m for m in wifi_metadata})
                         await self.send_frame(_generate_accept())
 
                     elif wire_frame.v1.introduction.file_metadata:
+                        file_metadata = wire_frame.v1.introduction.file_metadata
                         logger.debug(
                             "%r wants to send %r",
                             name,
-                            ", ".join(m.name for m in wire_frame.v1.introduction.file_metadata),
+                            ", ".join(m.name for m in file_metadata),
                         )
 
                         receive_mode = ReceiveMode.FILES
-                        request = ShareRequest(payload_header, to_pin(self.auth_string))
+                        request = ShareRequest(
+                            payload_header,
+                            to_pin(self.auth_string),
+                            sender=name,
+                            mode=receive_mode,
+                            items=[
+                                ShareItem(
+                                    name=safe_file_name(m.name),
+                                    size=m.size,
+                                    mime_type=m.mime_type,
+                                )
+                                for m in file_metadata
+                            ],
+                        )
                         await requests.put(request)
                         result = await request.respond
 
@@ -243,17 +374,34 @@ class ReceiveConnection(NearbyConnection):
                             logger.debug("Accepting introduction")
                             await self.send_frame(_generate_accept())
                             expected_payload_ids.update(
-                                {m.payload_id: m for m in wire_frame.v1.introduction.file_metadata},
+                                {m.payload_id: m for m in file_metadata},
                             )
                         else:
                             logger.debug("Rejecting introduction")
-                            # TODO: send a rejection
+                            await self._reject_introduction()
+                            break
 
                     elif wire_frame.v1.introduction.text_metadata:
+                        text_metadata = wire_frame.v1.introduction.text_metadata
                         receive_mode = ReceiveMode.TEXT
-                        request = ShareRequest(payload_header, to_pin(self.auth_string))
+                        logger.debug("%r wants to send text", name)
+
+                        request = ShareRequest(
+                            payload_header,
+                            to_pin(self.auth_string),
+                            sender=name,
+                            mode=receive_mode,
+                            items=[
+                                ShareItem(name=m.text_title, size=m.size) for m in text_metadata
+                            ],
+                        )
                         await requests.put(request)
-                        logger.debug("Receiving text")
+
+                        if not await request.respond:
+                            logger.debug("Rejecting text")
+                            await self._reject_introduction()
+                            break
+
                         expected_payload_ids.update(
                             {m.payload_id: m for m in wire_frame.v1.introduction.text_metadata},
                         )
@@ -267,7 +415,7 @@ class ReceiveConnection(NearbyConnection):
             if not expected_payload_ids and receive_mode is not None:
                 break
 
-        if request:
+        if request and not request.done.done():
             request.done.set_result(results)
 
 
@@ -277,6 +425,7 @@ async def _handle_client(
     writer: asyncio.StreamWriter,
     *,
     endpoint_id: bytes,
+    download_dir: Path | None = None,
 ) -> None:
     start = time.perf_counter()
     ip, port = writer.get_extra_info("peername")
@@ -304,7 +453,7 @@ async def _handle_client(
     conn.start_keep_alive()
     await conn.send_frame(generate_paired_key_encryption())
 
-    await conn.receive_loop(requests, name)
+    await conn.receive_loop(requests, name, download_dir=download_dir)
 
     duration = time.perf_counter() - start
     logger.debug("Connection with %r closed after %f seconds", name, duration)
@@ -317,10 +466,16 @@ async def _handle_client(
 
 
 async def _socket_server(
-    requests: asyncio.Queue[ShareRequest], *, interface_info: InterfaceInfo, endpoint_id: bytes
+    requests: asyncio.Queue[ShareRequest],
+    *,
+    interface_info: InterfaceInfo,
+    endpoint_id: bytes,
+    download_dir: Path | None = None,
 ) -> None:
     server = await asyncio.start_server(
-        lambda reader, writer: _handle_client(requests, reader, writer, endpoint_id=endpoint_id),
+        lambda reader, writer: _handle_client(
+            requests, reader, writer, endpoint_id=endpoint_id, download_dir=download_dir
+        ),
         interface_info.ips,
         interface_info.port,
     )
@@ -328,7 +483,11 @@ async def _socket_server(
     await server.serve_forever()
 
 
-async def receive(*, endpoint_id: bytes | None = None) -> AsyncIterator[ShareRequest]:
+async def receive(
+    *,
+    endpoint_id: bytes | None = None,
+    download_dir: Path | str | None = None,
+) -> AsyncIterator[ShareRequest]:
     """Receive something over Quick Share. Runs forever.
 
     This function registers an mDNS service and opens a socket server to receive data.
@@ -364,7 +523,23 @@ async def receive(*, endpoint_id: bytes | None = None) -> AsyncIterator[ShareReq
     services = [info]
     result: asyncio.Queue[ShareRequest] = asyncio.Queue()
 
-    create_task(_socket_server(result, interface_info=interface_info, endpoint_id=endpoint_id))
+    # Runs once at startup, before any transfer; not worth a thread hop.
+    directory = (
+        Path(download_dir).expanduser()  # noqa: ASYNC240
+        if download_dir
+        else default_download_dir()
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    logger.debug("Receiving into %s", directory)
+
+    create_task(
+        _socket_server(
+            result,
+            interface_info=interface_info,
+            endpoint_id=endpoint_id,
+            download_dir=directory,
+        )
+    )
     create_task(_start_mdns_service(services))
 
     while True:

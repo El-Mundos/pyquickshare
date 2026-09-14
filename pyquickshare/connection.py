@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import random
 from logging import getLogger
 from typing import TYPE_CHECKING
@@ -14,6 +13,7 @@ from .common import (
     payloadify,
 )
 from .protos import offline_wire_formats, wire_format
+from .sinks import MemorySink, PayloadSink
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -29,6 +29,18 @@ def _frame_type_name(frame_type: int) -> str:
         return f"UNKNOWN({frame_type})"
     else:
         return name if name is not None else f"UNKNOWN({frame_type})"
+
+
+async def _abort_sink(sink: PayloadSink) -> None:
+    """Discard a partially written payload, never raising.
+
+    This only ever runs while handling another failure, so letting a cleanup
+    error escape would mask the original error, which is the more useful one.
+    """
+    try:
+        await sink.abort()
+    except Exception:
+        logger.exception("Failed to clean up after an aborted payload")
 
 
 def _bw_event_name(event_type: int) -> str:
@@ -173,11 +185,23 @@ class NearbyConnection:
     ) -> None:
         self._v1_registry[frame_type] = handler
 
-    async def iter_payloads(
+    async def iter_payloads(  # noqa: C901
         self,
-    ) -> AsyncIterator[tuple[_PayloadHeader, bytes]]:
-        """Yield complete (PayloadHeader, bytes) payloads."""
-        incomplete: dict[int, io.BytesIO] = {}
+        *,
+        open_sink: Callable[[_PayloadHeader], PayloadSink] | None = None,
+        on_progress: Callable[[_PayloadHeader, int], None] | None = None,
+    ) -> AsyncIterator[tuple[_PayloadHeader, bytes | None]]:
+        """Yield (PayloadHeader, payload) once each payload completes.
+
+        Args:
+            open_sink: Chooses where a payload's bytes are written, given its
+                header. Defaults to accumulating in memory, in which case the
+                payload is yielded as ``bytes``. A sink that streams elsewhere
+                (see :class:`~.sinks.FileSink`) yields ``None`` instead.
+            on_progress: Called with the header and the running byte count each
+                time a chunk lands, for progress reporting.
+        """
+        incomplete: dict[int, PayloadSink] = {}
         headers: dict[int, _PayloadHeader] = {}
 
         while not self._backend.reader.at_eof():
@@ -206,17 +230,29 @@ class NearbyConnection:
             payload_chunk = frame.v1.payload_transfer.payload_chunk
 
             if payload_header.id not in incomplete:
-                incomplete[payload_header.id] = io.BytesIO()
+                incomplete[payload_header.id] = (
+                    open_sink(payload_header) if open_sink else MemorySink()
+                )
                 headers[payload_header.id] = payload_header
 
-            buf = incomplete[payload_header.id]
+            sink = incomplete[payload_header.id]
 
             if payload_chunk.offset is None:
                 logger.warning("Received payload chunk with no offset, treating as offset 0")
                 payload_chunk.offset = 0
 
-            buf.seek(payload_chunk.offset)
-            buf.write(payload_chunk.body)
+            try:
+                await sink.write(payload_chunk.offset, payload_chunk.body)
+            except OSError:
+                # Disk full, permission denied, device removed. The payload can
+                # never complete, so drop it rather than spin on every chunk.
+                logger.exception("Failed to write payload %d, aborting it", payload_header.id)
+                await _abort_sink(incomplete.pop(payload_header.id))
+                headers.pop(payload_header.id, None)
+                continue
+
+            if on_progress is not None:
+                on_progress(payload_header, sink.received)
 
             logger.log(SILLY, "Received payload chunk %d", payload_header.id)
 
@@ -225,12 +261,15 @@ class NearbyConnection:
                 continue
 
             if payload_chunk.flags & 0b00000001:
-                buf.seek(0)
-                payload = buf.read()
-                buf.close()
                 incomplete.pop(payload_header.id)
                 original_header = headers.pop(payload_header.id)
-                yield original_header, payload
+                yield original_header, await sink.finish()
+
+        # The connection ended with payloads still in flight -- the sender went
+        # away mid-transfer. Nothing will ever complete these.
+        for payload_id, sink in incomplete.items():
+            logger.debug("Connection ended with payload %d incomplete", payload_id)
+            await _abort_sink(sink)
 
     def start_keep_alive(self) -> None:
         """Start the background keep-alive task."""
