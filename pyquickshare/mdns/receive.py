@@ -102,18 +102,35 @@ def parse_endpoint_info(n: bytes) -> EndpointInfo:
     return EndpointInfo(visible, device_type, name, records)
 
 
-def make_n(*, visible: bool, type: Type, name: bytes) -> bytearray:  # noqa: ARG001 # TODO: fix this
+def make_n(*, visible: bool, type: Type, name: bytes) -> bytearray:
+    """Build the endpoint info blob advertised as the mDNS ``n`` record.
+
+    Layout, matching :func:`parse_endpoint_info`:
+
+    ==========  =====  =================================================
+    Offset      Size   Field
+    ==========  =====  =================================================
+    0           1      flags: reserved (3) visibility (1) type (3) pad (1)
+    1           2      salt
+    3           14     encrypted metadata key
+    17          1      length of name
+    18          N      name, UTF-8
+    ==========  =====  =================================================
+
+    The flags byte previously had the constant 2 written into it, ignoring both
+    arguments, which decodes as type ``phone`` regardless of what the caller
+    asked for -- so a laptop advertised itself as a phone, and ``visible=False``
+    did nothing.
+    """
     n = bytearray()
 
-    # n record:
-    # one byte: flags (3) visibility (1) type (3) empty (1)
-    # 16 zero bytes
-    # one byte: length of name
-    # name, utf-8 encoded
+    # Visibility is inverted on the wire: the bit is set when hidden.
+    flags = (0 if visible else 1) << 4 | (type.value & 0b111) << 1
+    n.append(flags)
 
-    n.append(2)  # flags
-    # add 16 0 bytes
-    n.extend([random.randint(1, 8) for _ in range(16)])  # noqa: S311 - random is fine here
+    # 2 bytes of salt followed by a 14 byte encrypted metadata key. We do not
+    # implement contact-based visibility, so these only need to be non-constant.
+    n.extend(random.randbytes(16))  # noqa: S311 - not used for anything sensitive
     n.append(len(name))
     n.extend(name)
     return n

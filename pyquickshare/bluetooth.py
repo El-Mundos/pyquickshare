@@ -120,6 +120,53 @@ async def connect_bluetooth_device(device: BluetoothDevice) -> socket.socket:
     return sock
 
 
+VERSION_AND_PCP = 0x23
+"""Version 1 in the upper 3 bits, PCP 3 in the lower 5. Matches make_service_name."""
+
+SERVICE_ID_HASH = (0xFC, 0x9F, 0x5E)
+"""SHA-256 of the Quick Share service ID, truncated to 3 bytes."""
+
+ENDPOINT_ID_LENGTH = 4
+MAX_ENDPOINT_INFO_LENGTH = 131
+"""The layout gives endpoint_info a single length byte, and Quick Share caps it here."""
+
+
+def make_bluetooth_device_name(endpoint_id: bytes, endpoint_info: bytes) -> str:
+    """Build the Bluetooth adapter name a Quick Share sender expects to find.
+
+    Inverse of :func:`parse_bluetooth_device_name`; see the byte layout
+    documented there. Sending devices read the adapter's name and decode our
+    endpoint info out of it, so this is what makes a machine discoverable as a
+    Quick Share target without any shared network.
+
+    Args:
+        endpoint_id: Exactly 4 ASCII bytes, as from ``generate_endpoint_id``.
+        endpoint_info: The raw ``n`` record blob from ``make_n``.
+    """
+    if len(endpoint_id) != ENDPOINT_ID_LENGTH:
+        msg = f"endpoint_id must be {ENDPOINT_ID_LENGTH} bytes, got {len(endpoint_id)}"
+        raise ValueError(msg)
+
+    if len(endpoint_info) > MAX_ENDPOINT_INFO_LENGTH:
+        msg = (
+            f"endpoint_info must be at most {MAX_ENDPOINT_INFO_LENGTH} bytes, "
+            f"got {len(endpoint_info)}"
+        )
+        raise ValueError(msg)
+
+    blob = bytearray()
+    blob.append(VERSION_AND_PCP)
+    blob.extend(endpoint_id)
+    blob.extend(SERVICE_ID_HASH)
+    blob.append(0x00)  # field byte; bit 0 would flag WebRTC connectable
+    blob.extend(bytes(6))  # reserved
+    blob.append(len(endpoint_info))
+    blob.extend(endpoint_info)
+    # No UWB address; the trailing optional field is simply omitted.
+
+    return to_url64(blob)
+
+
 def parse_bluetooth_device_name(name: str) -> EndpointInfo:
     # Offset	Size	    Field	               Notes
     # 0	        1 byte	    version_and_pcp	       Upper 3 bits = version, lower 5 bits = PCP
