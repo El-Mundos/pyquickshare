@@ -25,7 +25,7 @@ from .common import (
     pick_mac_deterministically,
     safe_assert,
 )
-from .bluetooth import BluetoothAdvertisement, advertise_over_bluetooth
+from .bluetooth import QUICKSHARE_LE_PSM, BluetoothAdvertisement, advertise_over_bluetooth
 from .connection import NearbyConnection
 from .mdns.receive import (
     IPV4Runner,
@@ -493,6 +493,50 @@ def _format_peer(peer: object) -> str:
     return repr(peer)
 
 
+async def _le_l2cap_server(
+    requests: asyncio.Queue[ShareRequest],
+    *,
+    endpoint_id: bytes,
+    download_dir: Path | None = None,
+) -> bool:
+    """Listen on the BLE L2CAP channel Android uses for off-network transfers.
+
+    SOCK_STREAM rather than SOCK_SEQPACKET: both work at the kernel level for a
+    credit-based LE channel, but asyncio refuses anything that is not a stream
+    socket, and the protocol above wants a byte stream in any case.
+
+    The address is a four-tuple. Python's two-tuple L2CAP form implies BR/EDR and
+    is rejected outright for an LE PSM.
+    """
+    try:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_L2CAP)
+    except (AttributeError, OSError):
+        logger.info("BLE L2CAP is unavailable, receiving over the network only")
+        return False
+
+    try:
+        sock.bind(("00:00:00:00:00:00", QUICKSHARE_LE_PSM, 0, socket.BDADDR_LE_PUBLIC))
+        sock.setblocking(False)
+    except OSError:
+        logger.warning(
+            "Could not bind LE L2CAP PSM 0x%04x, receiving over the network only",
+            QUICKSHARE_LE_PSM,
+        )
+        sock.close()
+        return False
+
+    server = await asyncio.start_server(
+        lambda reader, writer: _handle_client(
+            requests, reader, writer, endpoint_id=endpoint_id, download_dir=download_dir
+        ),
+        sock=sock,
+    )
+
+    logger.debug("Listening for Quick Share over BLE L2CAP PSM 0x%04x", QUICKSHARE_LE_PSM)
+    create_task(server.serve_forever())
+    return True
+
+
 async def _handle_bluetooth_fd(
     requests: asyncio.Queue[ShareRequest],
     fd: int,
@@ -606,6 +650,12 @@ async def receive(
     create_task(_start_mdns_service(services))
 
     if bluetooth:
+        # The transport Android actually uses off-network. RFCOMM below stays
+        # registered because it publishes the SDP record, and because it is how
+        # older senders may still connect, but this is the one that carries a
+        # transfer when the phone has no network.
+        await _le_l2cap_server(result, endpoint_id=endpoint_id, download_dir=directory)
+
         # BlueZ owns the RFCOMM socket and hands us a connected fd per client,
         # so it also allocates the channel and publishes the SDP record.
         def on_bluetooth_connection(fd: int, device: str) -> None:

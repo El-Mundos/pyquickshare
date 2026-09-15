@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import secrets
 import socket
 from collections.abc import AsyncGenerator, Callable
 from typing import Any, cast
@@ -139,6 +138,23 @@ VERSION_AND_PCP = 0x23
 SERVICE_ID_HASH = (0xFC, 0x9F, 0x5E)
 """SHA-256 of the Quick Share service ID, truncated to 3 bytes."""
 
+QUICKSHARE_LE_PSM = 0x0090
+"""L2CAP PSM published for off-network transfers, in the LE dynamic range.
+
+A sender reads this out of our advertisement and opens an LE L2CAP channel to
+it. It was previously filled with random bytes, so the phone dutifully connected
+to a different, unbound PSM on every run -- observed as 144 on one attempt and 63
+on the next, each refused by the kernel with "PSM not supported".
+"""
+
+RFCOMM_CHANNEL = 8
+"""Channel published for the Quick Share service.
+
+Any free channel works, since senders resolve it over SDP rather than assuming
+one. It is fixed rather than allocated so a firewall or audit has something
+stable to refer to.
+"""
+
 _MAC_LENGTH = 6
 _RECEIVE_ADVERTISEMENT_HEADER = 0x48
 _RECEIVE_ADVERTISEMENT_PREFIX_LENGTH = 8
@@ -185,7 +201,7 @@ def make_bluetooth_device_name(endpoint_id: bytes, endpoint_info: bytes) -> str:
     return to_url64(blob)
 
 
-def make_advertisement_trailer(bluetooth_mac: bytes) -> bytes:
+def make_advertisement_trailer(bluetooth_mac: bytes, psm: int = QUICKSHARE_LE_PSM) -> bytes:
     """Build the trailing block that tells a sender where to connect.
 
     Captured from three real advertisements across two Android phones. The first
@@ -198,10 +214,12 @@ def make_advertisement_trailer(bluetooth_mac: bytes) -> bytes:
     to reach. It matches the observed failure, where a phone with Wi-Fi disabled
     never opened a Bluetooth connection at all.
 
-    The remaining bytes are less certain. Two captures of the same phone differed
-    only in offsets 8, 9 and 12, while ``01 00`` at offsets 10 and 11 held across
-    every capture from both devices, so that pair is treated as constant and the
-    rest as a rotating counter.
+    Offsets 8 and 9 are the L2CAP PSM the sender should connect to, little
+    endian. That was established by accident and then confirmed: filling them
+    with random bytes made the phone request a different PSM on every run -- 144
+    once, 63 the next -- each refused by the kernel as unbound. ``01 00`` at
+    offsets 10 and 11 held across every capture from both devices. Offset 12
+    varies and is still unidentified.
     """
     if len(bluetooth_mac) != _MAC_LENGTH:
         msg = f"bluetooth_mac must be {_MAC_LENGTH} bytes, got {len(bluetooth_mac)}"
@@ -209,9 +227,14 @@ def make_advertisement_trailer(bluetooth_mac: bytes) -> bytes:
 
     trailer = bytearray(bluetooth_mac)
     trailer.extend((0x00, 0x00))
-    trailer.extend(secrets.token_bytes(2))  # varied between captures
+    # The L2CAP PSM a sender should connect to, little endian. This is what
+    # varied between captures; filling it with random bytes sent the phone to an
+    # unbound PSM every time.
+    trailer.extend(psm.to_bytes(2, "little"))
     trailer.extend((0x01, 0x00))  # constant across every capture seen
-    trailer.extend(secrets.token_bytes(1))  # varied between captures
+    # Deterministic while the remaining fields are being identified: a random
+    # value here is indistinguishable from a field we are filling in wrongly.
+    trailer.append(0x00)
     return bytes(trailer)
 
 
@@ -329,7 +352,13 @@ async def advertise_over_bluetooth(
             {
                 "Name": Variant("s", "Quick Share"),
                 "Role": Variant("s", "server"),
-                # BlueZ picks a free channel and publishes it over SDP.
+                # Without an explicit Channel, BlueZ publishes a service record
+                # whose ProtocolDescriptorList contains L2CAP alone. A sender
+                # then resolves our UUID over SDP, finds no RFCOMM layer and so
+                # no channel to open, and gives up: observed as an ACL link that
+                # comes up, exchanges SDP, and is torn down seconds later.
+                # Naming a channel makes BlueZ emit [[L2CAP], [RFCOMM, n]].
+                "Channel": Variant("q", RFCOMM_CHANNEL),
                 "RequireAuthentication": Variant("b", False),
                 "RequireAuthorization": Variant("b", False),
             },

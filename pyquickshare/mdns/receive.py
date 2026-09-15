@@ -129,8 +129,12 @@ def make_n(*, visible: bool, type: Type, name: bytes) -> bytearray:
     n.append(flags)
 
     # 2 bytes of salt followed by a 14 byte encrypted metadata key. We do not
-    # implement contact-based visibility, so these only need to be non-constant.
-    n.extend(random.randbytes(16))  # noqa: S311 - not used for anything sensitive
+    # implement contact-based visibility, so these carry nothing meaningful.
+    # Held at zero rather than randomised while the advertisement format is
+    # still being identified: random bytes in a field whose meaning is unknown
+    # are indistinguishable from a field being filled in wrongly, which has
+    # already cost one misdiagnosis.
+    n.extend(bytes(16))
     n.append(len(name))
     n.extend(name)
     return n
